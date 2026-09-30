@@ -65,6 +65,14 @@ npm test          # node --test test/
 | `POST /api/peak/recompute` | 电流/温度变化致原计算失效：只撤销未执行动作并生成新修订，已生效事实保留 |
 | `POST /api/peak/cancel` | 手动撤销方案：仅作废尚未执行动作，已生效限功率/断电不消失 |
 | `POST /api/peak/restore` | 预算结束后分批恢复（`{maxBatchSize}`）；按可用余量与温度风险优先，途中遇更低上限暂停重算 |
+| `POST /api/precert/voyages` | 登记航次（合格证绑定航次）`{voyageId}` |
+| `POST /api/precert/setpoint` | 调整设定点 `{reeferId, setpointC}`：立即失效相关证书/观测并要求重测 |
+| `POST /api/precert/observe` | 发起/重新发起预冷观测 `{voyageId, reeferId, sensorBootId?, expectedVersion?}` |
+| `POST /api/precert/certificates` | 观测持续合格后签发合格证（`expectedVersion` 乐观前置，`operationId` 首次结果语义） |
+| `POST /api/precert/exemptions` | 临时豁免 `{voyageId, reeferId, reason, cargoOwner, ttlMinutes, expectedVersion?}` |
+| `POST /api/precert/scan` | 装船确认/岸桥扫描：查当前合格证/豁免，放行 RELEASED 或进入温控待处理 HELD |
+| `GET /api/precert/state` | 预冷读模型：合格进度、证据区间、失效原因、待处理箱、豁免倒计时、放行结果 |
+| `GET /api/precert/reefer?voyageId=&reeferId=` | 单箱在某航次下的完整预冷/放行画像 |
 | `GET /api/state` | 读模型：拓扑/实时负载/样本 + `peak`（预算曲线、新鲜度、削峰动作、温度风险、节省量、恢复进度） |
 
 ### 幂等语义
@@ -138,6 +146,66 @@ REEFER_NOT_POWERED / LIMIT_NOT_EFFECTIVE / NO_REVISION` 等。
 * 恢复途中收到更低上限：**暂停恢复**，在“已归还本批”的状态上重新计算并发布新修订，
   归还后不得越过有效预算；暂停批次前不会归还任何会导致越限的电流。
 * 累计节省电量 `cumulativeEnergyAmin`（A·min）只在动作恢复（或限功率被断电升级）时一次性记账，绝不重复计算。
+
+## 装船前预冷合格证与放行互锁
+
+冷藏箱装船前，系统从岸电模块的**真实温度读数**（箱温、设定点、温度变化速度、
+采样来源 `sensorBootId`、供电连续性）判定是否持续合格，只有数据在规定时间窗内
+持续合格，才签发绑定**箱号 + 航次 + 传感器启动代号 + 证据区间摘要**的合格证。
+
+### 合格判据（`src/precert/evaluate.js`）
+
+| 参数 | 普通货物 | 高风险（PHARMA/HIGH） | 环境变量覆盖 |
+|---|---|---|---|
+| 最短稳定时间 | 15 分钟 | **30 分钟** | `REEFER_PC_STABLE_MS` / `..._HIGH_...` |
+| 相对设定点最大偏差 | 1.5℃ | **0.5℃** | `REEFER_PC_DEVIATION_C` / `..._HIGH_...` |
+| 读数最大陈旧度 | 5 分钟 | **3 分钟** | `REEFER_PC_FRESH_MS` / `..._HIGH_...` |
+| 最大温度变化速度 | 4℃/h | **2℃/h** | `REEFER_PC_RATE_CPH` / `..._HIGH_...` |
+
+* 从最新读数向前回溯「持续合格后缀」（逐点查偏差与相邻变化速度），后缀时长不足稳定窗
+  即 `STABILIZING`，并返回 `remainingMs` 与 `restartFromAt`。
+* **不能用铭牌估算替代真实温度**：没有绑定传感器的真实温度读数直接 `NO_TEMPERATURE_READING`。
+
+### 自动失效（反应式，与触发事实同批原子落盘）
+
+`src/precert/reactor.js` 在每条业务批次落盘前推导反应事实：
+
+| 触发 | 既有合格证 | 进行中观测 | 临时豁免 |
+|---|---|---|---|
+| 读数过期（时间驱动） | `STALE_READING` 立即失效 | — | — |
+| 新传感器启动代号出现（**传感器更换**） | `SENSOR_REPLACED` 失效 | 旧观测作废 | — |
+| **设定点调整** `/api/precert/setpoint` | `SETPOINT_CHANGED` 失效 | 旧观测作废 | — |
+| 期间**掉电**（跳闸 FROZEN / 拔除 UNPLUGGED / powerLoss 样本） | `POWER_LOSS` 失效 | 旧观测作废 | `POWER_LOSS` 撤销 |
+| 出现新的**超温读数** | `TEMP_EXCURSION` 失效 | — | **自动撤销** |
+| 豁免到期 | — | — | `EXPIRED` 自动撤销 |
+
+失效回执与读模型都给出**重新观测起点 `restartFromAt` 与剩余稳定时长 `remainingMs`**；
+失效是单向终态——已失效证书重启后也不会复活。恢复供电后由值班员重新 `observe`，
+掉电点之后重新计时整个稳定窗（掉电前累计不带入）。
+
+### 装船确认 / 岸桥扫描与待处理队列
+
+`POST /api/precert/scan` 每次都查询当前有效合格证（优先）或有效豁免：
+
+* 有效 → `RELEASED`（携带依据 `basis.kind=CERTIFICATE/EXEMPTION`）；
+* 缺失/失效/过期 → `HELD` 进入**温控待处理队列**（开单幂等，重复扫描回放同一单），
+  **原装船计划与插座事实保持不变**；补证/补豁免后重新扫描即放行并关闭待处理单。
+
+### 临时豁免
+
+值班员可提交带 **原因 + 有效期（ttlMinutes）+ 货物负责人身份 cargoOwner** 的临时豁免；
+只覆盖**指定航次与箱号**，有倒计时；**后续出现新的超温或掉电即自动撤销**；
+签发合格证会关闭同箱豁免。豁免不替代真实温度判据，仅是限时人工放行依据。
+
+### operationId 首次结果语义与版本前置
+
+* 证书/豁免携带 `operationId`（缺省确定性生成）；写接口沿用 `X-Command-Id` 首次结果语义：
+  重放只返回首次证书/豁免，**同一观测区间不会签出两张有效证书**。
+* 每个 `(航次,箱)` 维护单调聚合版本 `pcVersions`；签发/豁免/观测接受 `expectedVersion`，
+  旧页面（落后版本）得到 409 `VERSION_STALE` 并带 `currentVersion`，**不能覆盖后来产生的失效状态**；
+  并发竞争由服务端串行链 + 版本前置收敛到单一证书或单一豁免，负者可重试。
+* 不变量：同一 `(航次,箱)` 至多一张 ISSUED 证书、一个 ACTIVE 豁免、一个 ACTIVE 观测、一条 OPEN 待处理；
+  有效证书与有效豁免不并存。
 
 ## 持久化与崩溃恢复
 

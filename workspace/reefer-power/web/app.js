@@ -42,6 +42,7 @@ function render() {
   renderTopology();
   renderReefers();
   renderPeak();
+  renderPrecert();
   renderTrips();
   renderSamples();
 }
@@ -512,6 +513,167 @@ function adminHtml() {
     </p>
   </div>`;
 }
+
+// ---------------- 预冷合格证 / 装船放行 ----------------
+const fmtMin = (ms) => ms == null ? '—' : `${Math.round(ms / 60000)} 分钟`;
+const fmtCountdown = (sec) => {
+  if (sec <= 0) return '已到期';
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return (h ? `${h}时` : '') + `${m}分${h ? '' : s + '秒'}`;
+};
+
+function certBadge(c) {
+  if (!c) return '<span class="muted">无合格证</span>';
+  if (c.status === 'ISSUED' && c.valid) return '<span class="good">合格证有效</span>';
+  return `<span class="danger">合格证已失效</span>`;
+}
+
+function renderPrecert() {
+  const pc = state.precert;
+  if (!pc || !pc.voyages.length) {
+    $('#tab-precert').innerHTML = `<div class="panel">
+      <h3>预冷合格证与装船放行</h3>
+      <p class="muted">尚无观测/证书数据。先在下方登记航次，再由值班员发起预冷观测。</p>
+      ${precertToolbarHtml()}
+    </div>`;
+    return;
+  }
+
+  const holdsHtml = pc.openHolds.length ? `<div class="panel">
+      <h3>温控待处理队列（${pc.openHolds.length}）<span class="tag danger">拦截装船</span></h3>
+      <table><thead><tr><th>待处理号</th><th>航次</th><th>箱号</th><th>槽位</th><th>拦截原因</th><th>等待</th><th>当前可放行</th><th>操作</th></tr></thead><tbody>
+      ${pc.openHolds.map((h) => `<tr>
+        <td>${esc(h.id)}</td><td>${esc(h.voyageId)}</td><td><b>${esc(h.reeferId)}</b></td>
+        <td>${esc(h.slotCode ?? '—')}</td><td><span class="danger">${esc(h.reason)}</span></td>
+        <td>${fmtMin(h.ageMs)}</td>
+        <td>${h.releasableNow ? '<span class="good">可放行</span>' : '<span class="muted">否</span>'}</td>
+        <td>${h.releasableNow ? `<button onclick="pcScan('${h.voyageId}','${h.reeferId}')">重新扫描放行</button>` :
+             `<button class="ghost" onclick="pcObserve('${h.voyageId}','${h.reeferId}')">恢复/重新观测</button>`}</td>
+      </tr>`).join('')}
+      </tbody></table></div>` : '';
+
+  const voyagesHtml = pc.voyages.map((v) => `<div class="panel">
+    <h3>航次 ${esc(v.voyageId)}
+      <span class="tag ${v.counts.certified ? 'good' : ''}">已证 ${v.counts.certified}</span>
+      <span class="tag ${v.counts.exempted ? 'warn' : ''}">豁免 ${v.counts.exempted}</span>
+      <span class="tag ${v.counts.blocked ? 'danger' : ''}">受阻 ${v.counts.blocked}</span>
+      <span class="tag">待处理 ${v.counts.openHolds}</span>
+    </h3>
+    <table><thead><tr><th>箱号</th><th>风险</th><th>设定/实测</th><th>观测合格进度</th><th>证据区间</th><th>合格证</th><th>豁免倒计时</th><th>放行</th><th>操作</th></tr></thead><tbody>
+    ${v.reefers.map((r) => reeferPrecertRow(r)).join('')}
+    </tbody></table>
+  </div>`).join('');
+
+  $('#tab-precert').innerHTML = precertToolbarHtml() + holdsHtml + voyagesHtml;
+}
+
+function reeferPrecertRow(r) {
+  const obs = r.observation;
+  const lt = r.lastTemperature;
+  const progress = obs ? `<div class="meter"><div class="track"><div class="fill ${obs.qualified ? '' : 'over'}" style="width:${obs.percent}%"></div></div>
+      <div class="nums">${obs.percent}% · 还需 ${fmtMin(obs.remainingMs)}${obs.qualified ? ' · <span class="good">已持续合格</span>' : ` · <span class="warn">${esc(obs.reason ?? '')}</span>`}</div></div>`
+    : '<span class="muted">未观测</span>';
+  const evidence = obs?.evidence ? `<div class="muted">${fmtDateTime(obs.evidence.fromAt)}<br>~ ${fmtTime(obs.evidence.toAt)} · ${obs.evidence.sampleCount} 点<br>${obs.evidence.minC}~${obs.evidence.maxC}℃</div>` : '—';
+  const c = r.certificate;
+  const certCell = c ? `<div>${certBadge(c)}</div>
+      ${c.status === 'INVALID' ? `<div class="danger">${esc(c.invalidateReason)}</div>
+        <div class="muted">从 ${fmtDateTime(c.restartHint?.restartFromAt)} 起重测，还需 ${fmtMin(c.restartHint?.remainingMs)}</div>` : ''}`
+    : '<span class="muted">—</span>';
+  const ex = r.exemption;
+  const exCell = ex ? `<div>${ex.valid ? '<span class="warn">豁免生效</span>' : '<span class="muted">' + esc(ex.status) + '</span>'}</div>
+      <div class="muted">${ex.valid ? fmtCountdown(ex.secondsRemaining) : esc(ex.revokeReason ?? '')}</div>` : '—';
+  const release = r.release.allowed
+    ? `<span class="good">放行 · ${r.release.basis === 'CERTIFICATE' ? '合格证' : '豁免'}</span>`
+    : `<span class="danger">拦截 · ${esc(r.release.reason)}</span>`;
+  return `<tr>
+    <td><b>${esc(r.reeferId)}</b></td>
+    <td>${r.highRisk ? '<span class="danger">高风险</span>' : '普通'}<div class="muted">±${r.params.maxDeviationC}℃/${fmtMin(r.params.requiredStableMs)}</div></td>
+    <td>${r.setpointC ?? '—'}℃<div class="muted">${lt ? `${lt.value}℃ ${lt.fresh ? '' : '<span class="danger">(过期)</span>'}` : '无真实读数'}</div></td>
+    <td style="min-width:160px">${progress}</td>
+    <td>${evidence}</td>
+    <td>${certCell}</td>
+    <td>${exCell}</td>
+    <td>${release}</td>
+    <td>
+      <button class="ghost" onclick="pcObserve('${r.voyageId}','${r.reeferId}')">观测</button>
+      <button onclick="pcIssue('${r.voyageId}','${r.reeferId}',${r.version})">签发</button>
+      <button class="warn" onclick="pcExempt('${r.voyageId}','${r.reeferId}',${r.version})">豁免</button>
+      <button class="ghost" onclick="pcScan('${r.voyageId}','${r.reeferId}')">扫描</button>
+    </td>
+  </tr>`;
+}
+
+function precertToolbarHtml() {
+  return `<div class="panel">
+    <h3>装船前预冷合格证 / 放行互锁</h3>
+    <p class="muted">系统从岸电真实温度读数（箱温/设定点/变化速度/采样来源 sensorBootId/供电连续性）判定；
+      仅当数据在时间窗内持续合格才签发绑定箱号、航次、传感器启动代号与证据区间的合格证。
+      读数过期、传感器更换、设定点调整或期间掉电，证书立即失效。高风险货物使用更严阈值，<b>不能用铭牌估算替代真实温度</b>。</p>
+    <p>
+      航次 <input id="pcVoyage" value="V1" style="width:90px" />
+      箱号 <input id="pcReefer" placeholder="R1" style="width:100px" />
+      传感器启动代号 <input id="pcBoot" placeholder="默认取最新读数" style="width:150px" />
+    </p>
+    <p>
+      <button onclick="pcRegisterVoyage()">登记航次</button>
+      <button class="ghost" onclick="pcObserve2()">发起/重新观测</button>
+      <button class="warn" onclick="pcSetpoint()">调整设定点</button>
+    </p>
+  </div>`;
+}
+
+function pcInputs() {
+  return {
+    voyageId: $('#pcVoyage').value.trim(),
+    reeferId: $('#pcReefer').value.trim(),
+    sensorBootId: $('#pcBoot').value.trim() || undefined,
+  };
+}
+window.pcRegisterVoyage = async () => {
+  const { voyageId } = pcInputs();
+  try { await api('/api/precert/voyages', { voyageId }); toast(`航次 ${voyageId} 已登记`); await refresh(); }
+  catch (e) { toast(e.message, 'err'); }
+};
+window.pcObserve2 = async () => {
+  const { voyageId, reeferId, sensorBootId } = pcInputs();
+  await window.pcObserve(voyageId, reeferId, sensorBootId);
+};
+window.pcObserve = async (voyageId, reeferId, sensorBootId) => {
+  const body = { voyageId, reeferId };
+  if (sensorBootId) body.sensorBootId = sensorBootId;
+  try { const r = await api('/api/precert/observe', body);
+    toast(`观测 ${r.observationId} 已开始/重置（传感器 ${r.sensorBootId}）`); await refresh();
+  } catch (e) { toast(e.payload?.error ? `${e.payload.error.code}: ${e.message}` : e.message, 'err'); }
+};
+window.pcIssue = async (voyageId, reeferId, version) => {
+  try { const r = await api('/api/precert/certificates', { voyageId, reeferId, expectedVersion: version });
+    toast(`合格证 ${r.certificateId} 已签发`); await refresh();
+  } catch (e) {
+    const p = e.payload?.error?.progress;
+    toast(p ? `尚不能签发：${p.reason}，还需 ${fmtMin(p.remainingMs)}` : e.message, 'err');
+  }
+};
+window.pcExempt = async (voyageId, reeferId, version) => {
+  const reason = prompt('豁免原因'); if (reason == null) return;
+  const cargoOwner = prompt('货物负责人身份'); if (cargoOwner == null) return;
+  const ttl = Number(prompt('有效期（分钟）', '60'));
+  try { const r = await api('/api/precert/exemptions', { voyageId, reeferId, reason, cargoOwner, ttlMinutes: ttl, expectedVersion: version });
+    toast(`豁免 ${r.exemptionId} 已签发，剩余 ${r.secondsRemaining}s`); await refresh();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.pcScan = async (voyageId, reeferId) => {
+  try { const r = await api('/api/precert/scan', { voyageId, reeferId });
+    toast(r.outcome === 'RELEASED' ? `${reeferId} 放行（${r.basis.kind}）` : `${reeferId} 进入待处理：${r.reason}`, r.outcome === 'RELEASED' ? 'ok' : 'err');
+    await refresh();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.pcSetpoint = async () => {
+  const { reeferId } = pcInputs();
+  const setpointC = Number(prompt('新设定点温度(℃)'));
+  if (!reeferId || !Number.isFinite(setpointC)) return;
+  try { await api('/api/precert/setpoint', { reeferId, setpointC }); toast('设定点已调整，相关证书已失效'); await refresh(); }
+  catch (e) { toast(e.message, 'err'); }
+};
 
 function readJson(id) {
   try { return JSON.parse($('#' + id).value); }

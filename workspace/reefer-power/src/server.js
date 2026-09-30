@@ -9,6 +9,16 @@ import { DomainError, errBody, commandHash, payloadHash } from './util.js';
 import { trippedImpact } from './planner.js';
 import { now, advanceClock, clockOffset } from './clock.js';
 import { buildPeakView } from './peak/views.js';
+import { buildPrecertView, precertForReefer } from './precert/views.js';
+import { deriveReactionFacts } from './precert/reactor.js';
+import {
+  cmdVoyageRegister,
+  cmdSetpoint,
+  cmdObserve,
+  cmdCertIssue,
+  cmdExemption,
+  cmdLoadingScan,
+} from './precert/commands.js';
 import {
   cmdTopology,
   cmdReefers,
@@ -54,10 +64,19 @@ const ROUTES = {
   '/api/peak/recompute': { POST: cmdPeakRecompute },
   '/api/peak/cancel': { POST: cmdPeakCancel },
   '/api/peak/restore': { POST: cmdRestore },
+  // —— 装船前预冷合格证与放行互锁 ——
+  '/api/precert/voyages': { POST: cmdVoyageRegister },
+  '/api/precert/setpoint': { POST: cmdSetpoint },
+  '/api/precert/observe': { POST: cmdObserve },
+  '/api/precert/certificates': { POST: cmdCertIssue },
+  '/api/precert/exemptions': { POST: cmdExemption },
+  '/api/precert/scan': { POST: cmdLoadingScan },
 };
 
 export function createApp({ dir, testFaults = false } = {}) {
   const store = new Store(dir || path.join(__dirname, '..', 'data'));
+  // 自动失效/撤销/掉电事件与触发它们的业务事实同批原子落盘
+  store.reactor = (base, folded, facts, at) => deriveReactionFacts(base, folded, facts, at);
   let chain = Promise.resolve();
 
   function readBody(req) {
@@ -96,7 +115,21 @@ export function createApp({ dir, testFaults = false } = {}) {
     if (req.method === 'GET' && url.pathname === '/api/state') {
       const at = now();
       const base = cmdState(store.state, {}, at).reply;
-      return send(res, 200, { ok: true, ...base, peak: buildPeakView(store.state, at) });
+      return send(res, 200, { ok: true, ...base, peak: buildPeakView(store.state, at), precert: buildPrecertView(store.state, at) });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/precert/state') {
+      const at = now();
+      return send(res, 200, { ok: true, ...buildPrecertView(store.state, at) });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/precert/reefer') {
+      const voyageId = url.searchParams.get('voyageId');
+      const reeferId = url.searchParams.get('reeferId');
+      if (!voyageId || !reeferId) {
+        return send(res, 400, errBody(new DomainError('BAD_REQUEST', '必须提供 voyageId 与 reeferId')));
+      }
+      const view = precertForReefer(store.state, voyageId, reeferId, now());
+      if (!view) return send(res, 404, errBody(new DomainError('NOT_FOUND', `冷藏箱不存在: ${reeferId}`)));
+      return send(res, 200, { ok: true, ...view });
     }
 
     const route = ROUTES[url.pathname];

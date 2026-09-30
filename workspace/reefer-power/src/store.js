@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { initialState, applyFact, assertInvariants } from './domain.js';
-import { setClockOffset, clockOffset, advanceClock } from './clock.js';
+import { setClockOffset, clockOffset, advanceClock, now } from './clock.js';
 
 // 供电事实、插座租约和迁移动作采用不可变流水（events.log JSONL）加快照（snapshot.json）。
 // 每个命令是一个原子批次：要么整批落入流水，要么完全没有。重启后从快照重放剩余批次归并唯一结果。
@@ -29,6 +29,8 @@ export class Store {
 
     // 故障注入：下次提交包含指定事实类型的批次时，落盘 fsync 后、内存归并前退出
     this.faultArm = null;
+    // 反应式归并器：根据业务事实推导自动失效/撤销/掉电事件（与业务事实同批原子落盘）
+    this.reactor = null;
   }
 
   _load() {
@@ -122,10 +124,22 @@ export class Store {
 
   // 串行化由 server 保证。返回 {reused:false, reply}
   commit({ commandId, hash, facts, reply, enrich, keyMode = 'cmd', status = 200 }) {
-    // enrich 在“假设已归并”的状态上预演，得到最终回执，再整体落盘
+    // 命令时刻：以业务事实时刻为准（与反应式失效/enrich 同一口径），否则取当前时钟
+    const timedFact = facts.find((f) => typeof f.at === 'number');
+    const commandAt = timedFact ? timedFact.at : now();
+    // 0) 反应式归并：在业务事实假设已落盘的状态上推导自动失效/撤销/掉电事件，
+    //    与业务事实合并为同一原子批次（读模型不参与写补偿，终态全部来自流水）。
+    let allFacts = facts;
+    if (this.reactor && facts.length) {
+      const folded = cloneState(this.state);
+      for (const fact of facts) applyFact(folded, fact);
+      allFacts = facts.concat(this.reactor(this.state, folded, facts, commandAt));
+    }
+
+    // enrich 在“业务+反应事实均已归并”的全新克隆上预演，得到最终回执后再整体落盘
     if (enrich) {
       const scratch = cloneState(this.state);
-      for (const fact of facts) applyFact(scratch, fact);
+      for (const fact of allFacts) applyFact(scratch, fact);
       reply = enrich(scratch);
     }
     const batch = {
@@ -134,7 +148,7 @@ export class Store {
       ts: Date.now(),
       commandId: commandId ?? null,
       hash,
-      facts,
+      facts: allFacts,
       reply,
       status,
     };
@@ -149,15 +163,15 @@ export class Store {
     }
 
     // 故障注入点：落盘完成但尚未归并 -> 重启必须重放出唯一结果
-    if (this.faultArm && facts.some((f) => f.type === this.faultArm.factType)) {
+    if (this.faultArm && allFacts.some((f) => f.type === this.faultArm.factType)) {
       const arm = this.faultArm;
       this.faultArm = null;
       console.error(`[fault] batch ${batch.seq} durable, injected exit before fold [${arm.factType}]`);
       process.exit(17);
     }
 
-    // 2) 内存归并
-    for (const fact of facts) applyFact(this.state, fact);
+    // 2) 内存归并（业务事实 + 反应事实，顺序与落盘一致）
+    for (const fact of allFacts) applyFact(this.state, fact);
     this.receipts.set(hash, { hash, commandId: commandId ?? null, seq: batch.seq, reply, status });
     if (commandId) this.commandIndex.set(commandId, hash);
     this.batchSeq = batch.seq;

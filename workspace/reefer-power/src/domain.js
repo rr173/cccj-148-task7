@@ -24,6 +24,19 @@ import { normPhase, num, round2, nameplateCurrentA, bad, DomainError } from './u
 //   ],
 //   restoreBatches:[ {id,at,sessionId,state,items,total,recoveredCount,paused,revisionPublished,energySavedAmin} ],
 //   energySavedAmin                                   // 累计节省电量（A·min），仅恢复时一次性记账
+//
+//   // —— 装船前预冷合格证与放行互锁 ——
+//   pcVoyages: Set<voyageId>,
+//   powerEvents:[ {reeferId, at, kind:'powerLost'|'powerRestored', reason} ],
+//   pcVersions: Map<"voyageId\0reeferId", number>,    // 聚合版本前置条件
+//   observations:[ {id,voyageId,reeferId,sensorBootId,startedAt,state,supersededAt,supersededBy?} ],
+//   certificates:[ {id,version,voyageId,reeferId,sensorBootId,issuedAt,status,
+//       highRisk,params,evidence,observationId,invalidatedAt,invalidateReason,restartHint,operationId} ],
+//   exemptions:[ {id,version,voyageId,reeferId,reason,cargoOwner,issuedAt,validUntil,status,
+//       closedAt,revokedAt,revokeReason,operationId,closedByCertId?} ],
+//   loadingHolds:[ {id,voyageId,reeferId,openedAt,state,slotCode,scannerId,resolution,resolvedAt,
+//       releaseId?,basis?} ],
+//   pcSeq                                            // 合格证域自增序号
 // }
 export function initialState() {
   return {
@@ -46,6 +59,14 @@ export function initialState() {
     shavingActions: [],
     restoreBatches: [],
     energySavedAmin: 0,
+    pcVoyages: new Set(),
+    powerEvents: [],
+    pcVersions: new Map(),
+    observations: [],
+    certificates: [],
+    exemptions: [],
+    loadingHolds: [],
+    pcSeq: 0,
   };
 }
 
@@ -143,6 +164,44 @@ export function assertInvariants(s, tag) {
       }
     }
   }
+
+  // —— 预冷合格证 / 豁免 / 待处理 不变量 ——
+  const certByKey = new Map();
+  for (const c of s.certificates) {
+    if (c.status !== 'ISSUED') continue;
+    const k = pcKey(c.voyageId, c.reeferId);
+    if (certByKey.has(k)) {
+      throw new Error(`不变量被破坏 (${tag}): ${k} 存在两张有效合格证 ${certByKey.get(k)} / ${c.id}`);
+    }
+    certByKey.set(k, c.id);
+  }
+  const exByKey = new Map();
+  for (const e of s.exemptions) {
+    if (e.status !== 'ACTIVE') continue;
+    const k = pcKey(e.voyageId, e.reeferId);
+    if (exByKey.has(k)) {
+      throw new Error(`不变量被破坏 (${tag}): ${k} 存在两张有效豁免 ${exByKey.get(k)} / ${e.id}`);
+    }
+    exByKey.set(k, e.id);
+    // 有效豁免与有效合格证不并存（签发合格证即关闭豁免）
+    if (certByKey.has(k)) {
+      throw new Error(`不变量被破坏 (${tag}): ${k} 有效豁免 ${e.id} 与有效合格证 ${certByKey.get(k)} 并存`);
+    }
+  }
+  const holdByKey = new Set();
+  for (const h of s.loadingHolds) {
+    if (h.state !== 'OPEN') continue;
+    const k = pcKey(h.voyageId, h.reeferId);
+    if (holdByKey.has(k)) throw new Error(`不变量被破坏 (${tag}): ${k} 存在两条 OPEN 待处理记录`);
+    holdByKey.add(k);
+  }
+  const obsByKey = new Set();
+  for (const o of s.observations) {
+    if (o.state !== 'ACTIVE') continue;
+    const k = pcKey(o.voyageId, o.reeferId);
+    if (obsByKey.has(k)) throw new Error(`不变量被破坏 (${tag}): ${k} 存在两个活动观测`);
+    obsByKey.add(k);
+  }
 }
 
 export function leaseClosed(l) {
@@ -188,6 +247,16 @@ export function applyFact(s, fact) {
     case 'shavingActionsInvalidated': return applyShavingActionsInvalidated(s, fact);
     case 'shavingActionsCancelled': return applyShavingActionsCancelled(s, fact);
     case 'restoreBatchRecorded': return applyRestoreBatch(s, fact);
+    case 'voyageRegistered': return applyVoyageRegistered(s, fact);
+    case 'setpointAdjusted': return applySetpointAdjusted(s, fact);
+    case 'powerEventRecorded': return applyPowerEvent(s, fact);
+    case 'observationStarted': return applyObservationStarted(s, fact);
+    case 'observationSuperseded': return applyObservationSuperseded(s, fact);
+    case 'certificateIssued': return applyCertificateIssued(s, fact);
+    case 'certificateInvalidated': return applyCertificateInvalidated(s, fact);
+    case 'exemptionIssued': return applyExemptionIssued(s, fact);
+    case 'exemptionClosed': return applyExemptionClosed(s, fact);
+    case 'loadingHoldRecorded': return applyLoadingHold(s, fact);
     default:
       throw new Error(`未知事实类型: ${fact.type}`);
   }
@@ -648,5 +717,251 @@ function applyRestoreBatch(s, f) {
     budgetActive: f.budgetActive,
     revisionPublished: f.revisionPublished || null,
   });
+  return s;
+}
+
+// ============================================================================
+// 装船前预冷合格证与放行互锁：事实归并（确定性纯函数）
+// ============================================================================
+function nextPcId(s, prefix) {
+  s.pcSeq += 1;
+  return `${prefix}${String(s.pcSeq).padStart(5, '0')}`;
+}
+export function pcKey(voyageId, reeferId) {
+  return `${voyageId} ${reeferId}`;
+}
+export function pcVersion(s, voyageId, reeferId) {
+  return s.pcVersions.get(pcKey(voyageId, reeferId)) ?? 0;
+}
+function bumpPcVersion(s, voyageId, reeferId) {
+  const k = pcKey(voyageId, reeferId);
+  const v = (s.pcVersions.get(k) ?? 0) + 1;
+  s.pcVersions.set(k, v);
+  return v;
+}
+export function activeObservation(s, voyageId, reeferId) {
+  return s.observations.find(
+    (o) => o.voyageId === voyageId && o.reeferId === reeferId && o.state === 'ACTIVE'
+  ) || null;
+}
+export function issuedCert(s, voyageId, reeferId) {
+  return s.certificates.find(
+    (c) => c.voyageId === voyageId && c.reeferId === reeferId && c.status === 'ISSUED'
+  ) || null;
+}
+export function activeExemption(s, voyageId, reeferId) {
+  return s.exemptions.find(
+    (e) => e.voyageId === voyageId && e.reeferId === reeferId && e.status === 'ACTIVE'
+  ) || null;
+}
+export function openHold(s, voyageId, reeferId) {
+  return s.loadingHolds.find(
+    (h) => h.voyageId === voyageId && h.reeferId === reeferId && h.state === 'OPEN'
+  ) || null;
+}
+
+function applyVoyageRegistered(s, f) {
+  s.pcVoyages.add(f.voyageId);
+  return s;
+}
+
+function applySetpointAdjusted(s, f) {
+  const r = s.reefers.get(f.reeferId);
+  if (!r) throw new Error(`设定点调整引用未知箱 ${f.reeferId}`);
+  r.setpointC = Number(f.setpointC);
+  r.setpointChangedAt = f.at;
+  return s;
+}
+
+function applyPowerEvent(s, f) {
+  // 同一(箱,时刻,kind)去重，保证反应式事实重放幂等
+  const dup = s.powerEvents.some(
+    (e) => e.reeferId === f.reeferId && e.at === f.at && e.kind === f.kind
+  );
+  if (dup) return s;
+  s.powerEvents.push({ reeferId: f.reeferId, at: f.at, kind: f.kind, reason: f.reason || null });
+  return s;
+}
+
+function applyObservationStarted(s, f) {
+  // 编号在归并时确定性自分配，避免与同批反应事实争用序号
+  if (f.observationId) {
+    if (s.observations.some((o) => o.id === f.observationId)) return s;
+  }
+  const id = f.observationId || nextPcId(s, 'OB');
+  // 同(航次,箱)只保留一个活动观测：旧观测被取代（保留行用于审计与证据追溯）
+  for (const o of s.observations) {
+    if (o.voyageId === f.voyageId && o.reeferId === f.reeferId && o.state === 'ACTIVE') {
+      o.state = 'SUPERSEDED';
+      o.supersededAt = f.at;
+      o.supersededBy = id;
+      o.supersedeReason = f.reason || 'RESTARTED';
+    }
+  }
+  if (s.observations.some((o) => o.id === id)) return s;
+  s.observations.push({
+    id,
+    voyageId: f.voyageId,
+    reeferId: f.reeferId,
+    sensorBootId: f.sensorBootId,
+    startedAt: f.startedAt,
+    state: 'ACTIVE',
+    supersededAt: null,
+    supersedeReason: null,
+  });
+  bumpPcVersion(s, f.voyageId, f.reeferId);
+  return s;
+}
+
+// 反应式：掉电 / 传感器更换 / 设定点调整时把进行中的观测作废（保留行用于审计）。
+function applyObservationSuperseded(s, f) {
+  for (const o of s.observations) {
+    if (o.id !== f.observationId) continue;
+    if (o.state !== 'ACTIVE') return s; // 幂等
+    o.state = 'SUPERSEDED';
+    o.supersededAt = f.at;
+    o.supersedeReason = f.reason;
+    if (f.bySensorBootId) o.bySensorBootId = f.bySensorBootId;
+    bumpPcVersion(s, o.voyageId, o.reeferId);
+    return s;
+  }
+  return s;
+}
+
+function applyCertificateIssued(s, f) {
+  if (f.certificateId && s.certificates.some((c) => c.id === f.certificateId)) return s;
+  const id = f.certificateId || nextPcId(s, 'PC');
+  // 单一有效证书：既有 ISSUED 证书必须已先被作废（同批 reaction 保证）。
+  // 此处防御性检查，违反即不变量错误，绝不静默签出第二张。
+  const existing = issuedCert(s, f.voyageId, f.reeferId);
+  if (existing) throw new Error(`箱 ${f.reeferId} 在航次 ${f.voyageId} 已存在有效合格证 ${existing.id}`);
+
+  const version = pcVersion(s, f.voyageId, f.reeferId);
+  s.certificates.push({
+    id,
+    version,
+    voyageId: f.voyageId,
+    reeferId: f.reeferId,
+    sensorBootId: f.sensorBootId,
+    setpointC: f.setpointC,
+    issuedAt: f.at,
+    status: 'ISSUED',
+    highRisk: !!f.highRisk,
+    params: { ...f.params },
+    evidence: { ...f.evidence },
+    observationId: f.observationId,
+    operatorId: f.operatorId,
+    operationId: f.operationId,
+    invalidatedAt: null,
+    invalidateReason: null,
+    restartHint: null,
+  });
+
+  // 签发合格证时关闭该(航次,箱)仍 ACTIVE 的临时豁免（豁免是放行的替代依据）
+  for (const e of s.exemptions) {
+    if (e.voyageId === f.voyageId && e.reeferId === f.reeferId && e.status === 'ACTIVE') {
+      e.status = 'CLOSED';
+      e.closedAt = f.at;
+      e.closedByCertId = id;
+    }
+  }
+  bumpPcVersion(s, f.voyageId, f.reeferId);
+  return s;
+}
+
+function applyCertificateInvalidated(s, f) {
+  const c = s.certificates.find((x) => x.id === f.certificateId);
+  if (!c) throw new Error(`作废事实引用未知合格证 ${f.certificateId}`);
+  // 失效是单向终态：已失效证书不能重新变为有效；重复作废幂等
+  if (c.status === 'INVALID') return s;
+  c.status = 'INVALID';
+  c.invalidatedAt = f.at;
+  c.invalidateReason = f.reason;
+  c.restartHint = f.restartHint
+    ? { ...f.restartHint }
+    : { restartFromAt: f.at, remainingMs: c.params.requiredStableMs ?? null };
+  bumpPcVersion(s, c.voyageId, c.reeferId);
+  return s;
+}
+
+function applyExemptionIssued(s, f) {
+  if (f.exemptionId && s.exemptions.some((e) => e.id === f.exemptionId)) return s;
+  const id = f.exemptionId || nextPcId(s, 'EX');
+  if (activeExemption(s, f.voyageId, f.reeferId)) {
+    throw new Error(`箱 ${f.reeferId} 在航次 ${f.voyageId} 已存在有效豁免`);
+  }
+  const version = pcVersion(s, f.voyageId, f.reeferId);
+  s.exemptions.push({
+    id,
+    version,
+    voyageId: f.voyageId,
+    reeferId: f.reeferId,
+    reason: f.reason,
+    cargoOwner: f.cargoOwner,
+    issuedAt: f.at,
+    validUntil: f.validUntil,
+    durationMs: f.validUntil - f.at,
+    status: 'ACTIVE',
+    operatorId: f.operatorId,
+    operationId: f.operationId,
+    highRisk: !!f.highRisk,
+    closedAt: null,
+    revokedAt: null,
+    revokeReason: null,
+    closedByCertId: null,
+  });
+  bumpPcVersion(s, f.voyageId, f.reeferId);
+  return s;
+}
+
+// 豁免终态：CLOSED（合格证签发覆盖）/ REVOKED（后续超温、掉电或到期）
+function applyExemptionClosed(s, f) {
+  const e = s.exemptions.find((x) => x.id === f.exemptionId);
+  if (!e) throw new Error(`豁免关闭事实引用未知豁免 ${f.exemptionId}`);
+  if (e.status !== 'ACTIVE') return s; // 幂等
+  e.status = f.terminal === 'CLOSED' ? 'CLOSED' : 'REVOKED';
+  if (e.status === 'REVOKED') {
+    e.revokedAt = f.at;
+    e.revokeReason = f.reason || 'AUTO_REVOKED';
+  } else {
+    e.closedAt = f.at;
+    e.closedByCertId = f.certId || e.closedByCertId || null;
+  }
+  bumpPcVersion(s, e.voyageId, e.reeferId);
+  return s;
+}
+
+function applyLoadingHold(s, f) {
+  if (f.event === 'opened') {
+    if (f.holdId && s.loadingHolds.some((h) => h.id === f.holdId)) return s;
+    const id = f.holdId || nextPcId(s, 'HD');
+    if (openHold(s, f.voyageId, f.reeferId)) throw new Error(`箱 ${f.reeferId} 在航次 ${f.voyageId} 已有待处理记录`);
+    s.loadingHolds.push({
+      id,
+      voyageId: f.voyageId,
+      reeferId: f.reeferId,
+      openedAt: f.at,
+      state: 'OPEN',
+      slotCode: f.slotCode ?? null,
+      scannerId: f.scannerId ?? null,
+      reason: f.reason ?? null,
+      resolution: null,
+      resolvedAt: null,
+      releaseId: null,
+      basis: null,
+    });
+    bumpPcVersion(s, f.voyageId, f.reeferId);
+    return s;
+  }
+  // resolved
+  const h = s.loadingHolds.find((x) => x.id === f.holdId);
+  if (!h) throw new Error(`待处理解决事实引用未知记录 ${f.holdId}`);
+  if (h.state !== 'OPEN') return s; // 幂等
+  h.state = 'RESOLVED';
+  h.resolvedAt = f.at;
+  h.resolution = f.resolution;
+  h.releaseId = f.releaseId ?? null;
+  h.basis = f.basis ?? null;
+  bumpPcVersion(s, h.voyageId, h.reeferId);
   return s;
 }
