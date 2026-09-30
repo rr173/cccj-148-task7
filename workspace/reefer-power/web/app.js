@@ -42,6 +42,7 @@ function render() {
   renderTopology();
   renderReefers();
   renderPeak();
+  renderPrecool();
   renderTrips();
   renderSamples();
 }
@@ -78,6 +79,12 @@ function renderSummary() {
     ['断电中', effectiveCuts, effectiveCuts ? 'alert' : ''],
     ['当前节省', peak ? `${peak.savings.currentSavingA}A` : '0A', 'ok'],
     ['恢复暂停', recoveryPaused ? '是' : '否', recoveryPaused ? 'alert' : ''],
+    ...(peak?.stats ? [
+      ['有效合格证', state.precool?.stats.validCerts ?? 0, 'ok'],
+      ['失效合格证', state.precool?.stats.invalidCerts ?? 0, (state.precool?.stats.invalidCerts ?? 0) ? 'warn' : ''],
+      ['有效豁免', state.precool?.stats.activeWaivers ?? 0, (state.precool?.stats.activeWaivers ?? 0) ? 'warn' : ''],
+      ['温控待处理', state.precool?.stats.openPending ?? 0, (state.precool?.stats.openPending ?? 0) ? 'alert' : ''],
+    ] : []),
     ['待审样本', q, q ? 'warn' : ''],
   ].map(([l, n, cls]) => `<div class="card ${cls}"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('');
 }
@@ -271,6 +278,163 @@ window.peakRestore = async (maxBatchSize) => {
     const r = await api('/api/peak/restore', { maxBatchSize });
     if (r.paused) toast(`恢复暂停（${r.pauseReason}），已发布新修订 R${r.revisionPublished}`, 'err');
     else toast(`恢复 ${r.restored ?? 0} 台`);
+    await refresh();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+// ---------------- 装船前预冷合格证与放行互锁 ----------------
+function renderPrecool() {
+  const p = state.precool;
+  if (!p) { $('#tab-precool').innerHTML = '<p class="muted">无预冷数据。</p>'; return; }
+
+  const reasonText = (r) => ({
+    POWER_LOSS: '期间掉电', SETPOINT_CHANGED: '设定点调整', SENSOR_BOOT_CHANGED: '传感器更换',
+    READING_STALE: '读数过期', DEVIATION_EXCEEDED: '温度偏差超限', RATE_EXCEEDED: '变化速度超限',
+    OVER_TEMPERATURE: '后续超温', WAIVER_EXPIRED: '豁免到期',
+  }[r] || r);
+
+  // 合格进度
+  const obsRows = p.observations.map((o) => {
+    const pr = o.progress || {};
+    const blockers = (o.blockers || []).map((b) => `<span class="danger">${esc(b.code)}</span>`).join(' ');
+    return `<tr>
+      <td><b>${esc(o.reeferId)}</b><div class="muted">${esc(o.voyageId)}</div></td>
+      <td>${esc(o.tierLabel)}</td>
+      <td>${o.status === 'READY' ? '<span class="good">可签发</span>' : `<span class="warn">${esc(o.status)}</span>${blockers ? '<div>' + blockers + '</div>' : ''}`}</td>
+      <td style="min-width:160px">
+        <div class="meter"><div class="track"><div class="fill ${pr.pct >= 100 ? '' : 'warn'}" style="width:${pr.pct ?? 0}%"></div></div>
+        <div class="nums">${pr.pct ?? 0}% · 合格 ${Math.round((pr.qualifiedMs ?? 0) / 60000)} / ${Math.round((pr.stableRequiredMs ?? 0) / 60000)} 分钟</div></div>
+        <div class="muted">最新 ${pr.latestValueC ?? '—'}℃ @ ${fmtTime(pr.latestMeasuredAt)} · ${pr.readingFresh ? '<span class="good">新鲜实测</span>' : '<span class="warn">过期/无</span>'}</div>
+      </td>
+      <td>${pr.restartRequired ? `<span class="danger">需重新观测</span><div class="muted">起点 ${fmtDateTime(pr.restartFrom)}<br>剩余 ${Math.round((pr.remainingMs ?? 0) / 60000)} 分钟</div>` : '<span class="muted">—</span>'}</td>
+      <td>
+        <button onclick="pcObserve('${esc(o.voyageId)}','${esc(o.reeferId)}')">${o.observationStartedAt ? '重新观测' : '发起观测'}</button>
+        <button onclick="pcIssue('${esc(o.voyageId)}','${esc(o.reeferId)}')">签发合格证</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  // 证书
+  const certRows = p.certs.map((c) => `<tr>
+    <td>${esc(c.id)}</td>
+    <td><b>${esc(c.reeferId)}</b><div class="muted">${esc(c.voyageId)}</div></td>
+    <td>${esc(c.tierLabel)}</td>
+    <td>${c.live ? '<span class="good">有效</span>' : `<span class="danger">已失效·${esc(reasonText(c.liveReason || c.invalidReason))}</span>`}</td>
+    <td>${esc(c.sensorBootId) ?? '—'}<div class="muted">设定 ${c.setpointC}℃</div></td>
+    <td>${c.evidence ? `${fmtDateTime(c.evidence.from)}<br>~ ${fmtDateTime(c.evidence.to)}<div class="muted">${c.evidence.sampleCount} 点 · ${c.evidence.minC}~${c.evidence.maxC}℃ · ${c.evidence.maxAbsRateCph}℃/h</div>` : '—'}</td>
+    <td>${c.live ? `${fmtDateTime(c.issuedAt)}` : `<div class="muted">${fmtDateTime(c.invalidatedAt)}</div>${c.restartFrom ? `<div class="danger">重新观测起点 ${fmtDateTime(c.restartFrom)}<br>剩余 ${Math.round((c.restartRemainingMs ?? 0) / 60000)} 分钟</div>` : ''}`}</td>
+  </tr>`).join('');
+
+  // 豁免（含倒计时）
+  const wvRows = p.waivers.map((w) => {
+    const live = w.live;
+    const mins = Math.round((w.remainingMs ?? 0) / 60000);
+    return `<tr>
+      <td>${esc(w.id)}</td>
+      <td><b>${esc(w.reeferId)}</b><div class="muted">${esc(w.voyageId)}</div></td>
+      <td>${live ? `<span class="warn">生效中 · 剩 ${mins} 分钟</span>` : `<span class="danger">${esc(reasonText(w.revokeReason) || w.liveStatus)}</span>`}</td>
+      <td>${esc(w.reason)}<div class="muted">货物负责人 ${esc(w.cargoOwner)} · ${esc(w.grantedBy)}</div></td>
+      <td>${fmtDateTime(w.validFrom)}<br>~ ${fmtDateTime(w.validTo)}</td>
+    </tr>`;
+  }).join('');
+
+  // 待处理队列
+  const pendRows = p.pending.map((q) => `<tr class="${q.status === 'OPEN' ? '' : 'muted'}">
+    <td>${esc(q.id)}</td>
+    <td><b>${esc(q.reeferId)}</b><div class="muted">${esc(q.voyageId)}</div></td>
+    <td>${q.status === 'OPEN' ? '<span class="danger">待处理</span>' : esc(q.resolution)}</td>
+    <td>${(q.reasons || []).map((r) => `<span class="danger">${esc(r)}</span>`).join(' ')}</td>
+    <td>${fmtDateTime(q.enteredAt)}<div class="muted">最近扫描 ${fmtDateTime(q.lastScanAt)} · ${esc(q.lastSlotCode || '')}</div></td>
+    <td>${q.status === 'OPEN' ? `
+      <button class="good" onclick="pcReobserve('${esc(q.voyageId)}','${esc(q.reeferId)}')">恢复后重新观测</button>
+      <button class="warn" onclick="pcWaive('${esc(q.voyageId)}','${esc(q.reeferId)}')">临时豁免</button>` : esc(q.resolvedBy || '')}</td>
+  </tr>`).join('');
+
+  // 装船放行结果
+  const scanRows = p.scans.slice(0, 60).map((g) => `<tr>
+    <td>${fmtDateTime(g.at)}</td>
+    <td><b>${esc(g.reeferId)}</b><div class="muted">${esc(g.voyageId)} · ${g.stage === 'LOAD_CONFIRM' ? '装船确认' : '岸桥扫描'}</div></td>
+    <td>${g.scannerId || ''}</td>
+    <td>${g.slotCode || ''}</td>
+    <td>${g.effectiveOutcome === 'RELEASED' ? '<span class="good">放行</span>' : g.effectiveOutcome === 'RELEASE_NOW_VOID' ? '<span class="warn">已放行(依据后失效)</span>' : '<span class="danger">待处理</span>'}</td>
+    <td class="muted">${g.certId || g.waiverId || (g.reasons || []).join(',')}</td>
+  </tr>`).join('');
+
+  $('#tab-precool').innerHTML = `
+  <div class="panel">
+    <h3>预冷观测合格进度（高风险更严：稳定 30 分钟 / 偏差 0.5℃）</h3>
+    <table><thead><tr><th>箱/航次</th><th>风险</th><th>状态</th><th>合格进度/证据</th><th>重新观测</th><th>操作</th></tr></thead>
+    <tbody>${obsRows || '<tr><td colspan="6" class="muted">尚未对任何箱发起观测。</td></tr>'}</tbody></table>
+  </div>
+  <div class="panel">
+    <h3>预冷合格证（绑定箱号/航次/传感器启动代号/观测区间）</h3>
+    <table><thead><tr><th>编号</th><th>箱/航次</th><th>风险</th><th>状态/失效原因</th><th>传感器/证据区间摘要</th><th>签发/失效与重测提示</th></tr></thead>
+    <tbody>${certRows || '<tr><td colspan="6" class="muted">尚无合格证。</td></tr>'}</tbody></table>
+  </div>
+  <div class="panel">
+    <h3>临时豁免（仅覆盖指定航次与箱号，超温/掉电自动撤销）</h3>
+    <table><thead><tr><th>编号</th><th>箱/航次</th><th>倒计时/状态</th><th>原因/货物负责人</th><th>有效期</th></tr></thead>
+    <tbody>${wvRows || '<tr><td colspan="5" class="muted">尚无豁免。</td></tr>'}</tbody></table>
+  </div>
+  <div class="panel">
+    <h3>温控待处理队列（装船计划与插座事实保持不变）</h3>
+    <table><thead><tr><th>条目</th><th>箱/航次</th><th>状态</th><th>原因</th><th>入队/扫描</th><th>处置</th></tr></thead>
+    <tbody>${pendRows || '<tr><td colspan="6" class="muted">队列为空。</td></tr>'}</tbody></table>
+  </div>
+  <div class="panel">
+    <h3>装船放行结果（装船确认 / 岸桥扫描）</h3>
+    <div class="grid2">
+      <label class="fld">航次<input id="pcVoyage" placeholder="VOY-1" value="VOY-1"></label>
+      <label class="fld">箱号<input id="pcReefer" placeholder="R1"></label>
+      <label class="fld">槽位<input id="pcSlot" placeholder="02-01-82"></label>
+      <label class="fld">扫描员<input id="pcScanner" placeholder="CRANE-1"></label>
+    </div>
+    <p><button class="good" onclick="pcScan(false)">岸桥扫描查询放行</button>
+       <button class="good" onclick="pcScan(true)">装船确认查询放行</button></p>
+    <table><thead><tr><th>时间</th><th>箱/航次</th><th>扫描员</th><th>槽位</th><th>结果</th><th>依据</th></tr></thead>
+    <tbody>${scanRows || '<tr><td colspan="6" class="muted">尚无扫描。</td></tr>'}</tbody></table>
+  </div>`;
+}
+
+window.pcObserve = async (voyageId, reeferId) => {
+  try { const r = await api('/api/precool/observe', { voyageId, reeferId, operatorId: 'DUTY' });
+    toast(r.reset ? '已重新发起观测，计时重新开始' : '观测已开始'); await refresh();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.pcIssue = async (voyageId, reeferId) => {
+  try { const r = await api('/api/precool/certificates', { voyageId, reeferId, operatorId: 'DUTY' });
+    toast(`合格证 ${r.certId} 已签发`); await refresh();
+  } catch (e) { toast(e.message + (e.payload?.error?.restartFrom ? '（需重新观测）' : ''), 'err'); }
+};
+window.pcReobserve = async (voyageId, reeferId) => {
+  try { await api('/api/precool/pending/resolve', { voyageId, reeferId, action: 'reobserve', operatorId: 'DUTY' });
+    toast('已在恢复供电后发起重新观测'); await refresh();
+  } catch (e) {
+    // 无开放待处理条目时直接发起观测
+    try { await api('/api/precool/observe', { voyageId, reeferId, operatorId: 'DUTY' }); toast('已发起重新观测'); await refresh(); }
+    catch (e2) { toast(e2.message, 'err'); }
+  }
+};
+window.pcWaive = async (voyageId, reeferId) => {
+  const reason = prompt('豁免原因（必填）');
+  if (reason == null) return;
+  const cargoOwner = prompt('货物负责人身份（必填）');
+  if (cargoOwner == null) return;
+  const mins = Number(prompt('有效分钟数（≤60）', '30'));
+  try {
+    const r = await api('/api/precool/waivers', { voyageId, reeferId, reason, cargoOwner, validMinutes: mins, operatorId: 'DUTY' });
+    toast(`豁免 ${r.waiverId} 已签发，剩 ${Math.round(r.expiresInMs / 60000)} 分钟`); await refresh();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.pcScan = async (isConfirm) => {
+  const voyageId = $('#pcVoyage').value.trim() || 'VOY-1';
+  const reeferId = $('#pcReefer').value.trim();
+  if (!reeferId) return toast('请输入箱号', 'err');
+  const body = { voyageId, reeferId, scannerId: $('#pcScanner').value.trim() || 'CRANE-1', slotCode: $('#pcSlot').value.trim() || null };
+  if (isConfirm) body.stage = 'LOAD_CONFIRM';
+  try {
+    const r = await api('/api/precool/gate-scan', body);
+    toast(r.outcome === 'RELEASED' ? `放行（${r.basis === 'CERT' ? '合格证' : '豁免'}）` : '缺失/失效：进入温控待处理队列', r.outcome === 'RELEASED' ? 'ok' : 'err');
     await refresh();
   } catch (e) { toast(e.message, 'err'); }
 };
@@ -510,8 +674,38 @@ function adminHtml() {
       <button class="warn" onclick="registerBudget()">登记预算并去削峰页</button>
       <button onclick="peakPublish()">立即发布削峰修订</button>
     </p>
+  </div>
+  <div class="panel">
+    <h3>7. 预冷合格证（观测/设定点调整）</h3>
+    <div class="grid2">
+      <label class="fld">航次<input id="pcVoy" value="VOY-1"></label>
+      <label class="fld">箱号<input id="pcBox" placeholder="R1"></label>
+      <label class="fld">新设定点℃（调整即令旧证失效）<input id="pcSetpoint" placeholder="-22"></label>
+    </div>
+    <p>
+      <button onclick="pcAdminObserve()">发起/重新观测</button>
+      <button class="warn" onclick="pcAdminSetpoint()">调整设定点</button>
+    </p>
   </div>`;
 }
+
+window.pcAdminObserve = async () => {
+  const voyageId = $('#pcVoy').value.trim();
+  const reeferId = $('#pcBox').value.trim();
+  if (!reeferId) return toast('请输入箱号', 'err');
+  try { await api('/api/precool/observe', { voyageId, reeferId, operatorId: 'OPS' });
+    toast('观测已发起/重置'); switchTab('precool'); await refresh();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.pcAdminSetpoint = async () => {
+  const reeferId = $('#pcBox').value.trim();
+  const toC = Number($('#pcSetpoint').value);
+  if (!reeferId || !Number.isFinite(toC)) return toast('请输入箱号与新设定点', 'err');
+  try { const r = await api('/api/precool/setpoint', { reeferId, toC, operatorId: 'OPS' });
+    toast(`设定点已调整为 ${toC}℃，${(r.invalidations || []).length} 项失效`);
+    switchTab('precool'); await refresh();
+  } catch (e) { toast(e.message, 'err'); }
+};
 
 function readJson(id) {
   try { return JSON.parse($('#' + id).value); }

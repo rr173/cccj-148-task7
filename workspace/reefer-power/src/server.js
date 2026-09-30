@@ -31,6 +31,15 @@ import {
   cmdPeakCancel,
   cmdRestore,
 } from './peak/commands.js';
+import {
+  cmdPrecoolObserve,
+  cmdCertIssue,
+  cmdWaiverGrant,
+  cmdGateScan,
+  cmdPendingResolve,
+  cmdSetpointAdjust,
+} from './precool/commands.js';
+import { buildPrecoolView, releaseDecision } from './precool/views.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = path.join(__dirname, '..', 'web');
@@ -54,6 +63,13 @@ const ROUTES = {
   '/api/peak/recompute': { POST: cmdPeakRecompute },
   '/api/peak/cancel': { POST: cmdPeakCancel },
   '/api/peak/restore': { POST: cmdRestore },
+  // —— 装船前预冷合格证与放行互锁 ——
+  '/api/precool/observe': { POST: cmdPrecoolObserve },
+  '/api/precool/certificates': { POST: cmdCertIssue },
+  '/api/precool/waivers': { POST: cmdWaiverGrant },
+  '/api/precool/gate-scan': { POST: cmdGateScan },
+  '/api/precool/pending/resolve': { POST: cmdPendingResolve },
+  '/api/precool/setpoint': { POST: cmdSetpointAdjust },
 };
 
 export function createApp({ dir, testFaults = false } = {}) {
@@ -96,7 +112,27 @@ export function createApp({ dir, testFaults = false } = {}) {
     if (req.method === 'GET' && url.pathname === '/api/state') {
       const at = now();
       const base = cmdState(store.state, {}, at).reply;
-      return send(res, 200, { ok: true, ...base, peak: buildPeakView(store.state, at) });
+      return send(res, 200, {
+        ok: true,
+        ...base,
+        peak: buildPeakView(store.state, at),
+        precool: buildPrecoolView(store.state, at),
+      });
+    }
+
+    // 放行判定查询（只读）：装船确认/岸桥可先查当前合格证
+    if (req.method === 'GET' && url.pathname === '/api/precool/release') {
+      const voyageId = url.searchParams.get('voyageId');
+      const reeferId = url.searchParams.get('reeferId');
+      if (!voyageId || !reeferId) {
+        return send(res, 400, errBody(new DomainError('BAD_REQUEST', '必须提供 voyageId 与 reeferId')));
+      }
+      const at = now();
+      return send(res, 200, { ok: true, at, voyageId, reeferId, ...releaseDecision(store.state, voyageId, reeferId, at) });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/precool/board') {
+      const at = now();
+      return send(res, 200, { ok: true, ...buildPrecoolView(store.state, at) });
     }
 
     const route = ROUTES[url.pathname];
@@ -111,13 +147,19 @@ export function createApp({ dir, testFaults = false } = {}) {
       return send(res, 400, errBody(e));
     }
 
-    const commandId = (req.headers['x-command-id'] || body.commandId || null)?.toString() || null;
+    let commandId = (req.headers['x-command-id'] || body.commandId || null)?.toString() || null;
+    // 预冷写接口的 operationId 同样采用首次结果语义，且优先于自动命令标识头：
+    // 同 operationId 回放首次结果（含首次失败），同键不同载荷 -> IDEMPOTENCY_CONFLICT。
+    if (url.pathname.startsWith('/api/precool/') && body.operationId) {
+      commandId = `op:${String(body.operationId)}`;
+    }
     const isSample = url.pathname === '/api/samples';
-    // 样本按纯内容摘要去重（同传感器/测量时刻/值即首次答复）；其余命令按 (命令标识,摘要) 去重
+    // 样本按纯内容摘要去重（同传感器/测量时刻/值即首次答复）；其余命令按 (命令标识,摘要) 去重。
+    // 摘要必须带路径名命名空间，否则不同接口上同构载荷（如 observe 与 issue）会互相误命中回放。
     const crypto = (await import('node:crypto')).createHash;
     const hash = isSample
-      ? crypto('sha256').update(payloadHash(body)).digest('hex')
-      : await commandHash(commandId || '__nocmd__', body);
+      ? crypto('sha256').update(`${url.pathname}\0${payloadHash(body)}`).digest('hex')
+      : crypto('sha256').update(`${url.pathname}\0${commandId ?? '__nocmd__'}\0${payloadHash(body)}`).digest('hex');
 
     // 查、执行、提交必须串行，保证两名电气员并发提交时先到者成功
     const keyMode = isSample ? 'content' : 'cmd';
@@ -153,10 +195,17 @@ export function createApp({ dir, testFaults = false } = {}) {
     try {
       result = handler(store.state, body, now());
     } catch (e) {
-      // 业务拒绝同样按命令标识留痕，重复提交回放首次拒绝
-      const reply = errBody(e);
-      const status = e instanceof DomainError ? (e.code === 'NOT_FOUND' ? 404 : e.code === 'CONFLICT' ? 409 : 400) : 500;
+      // 业务拒绝同样按命令标识留痕，重复提交回放首次拒绝。
+      // 预冷命令在“拒绝前”可能已产生自动失效事实（如本次读数过期使旧证书失效）：
+      // 这些事实必须随拒绝原子落盘——失效是已经发生的事实，不能因为签发被拒而消失。
       if (!(e instanceof DomainError)) throw e;
+      const reply = errBody(e);
+      const status = e.code === 'NOT_FOUND' ? 404 : e.code === 'CONFLICT' ? 409 : 400;
+      const facts = Array.isArray(e.extra?.facts) ? e.extra.facts : [];
+      if (facts.length) {
+        const { reply: durableReply, status: durableStatus } = store.commit({ commandId, hash, facts, reply, keyMode, status });
+        return Promise.resolve({ status: durableStatus, reply: durableReply });
+      }
       store.commit({ commandId, hash, facts: [], reply, keyMode, status });
       return Promise.resolve({ status, reply });
     }

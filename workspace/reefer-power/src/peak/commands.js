@@ -16,6 +16,7 @@ import { planShaving } from './planner.js';
 import { planRestoreBatch } from './recovery.js';
 import { projectedLoads, basisSignature, activeActionOf } from './load.js';
 import { cloneState } from '../store.js';
+import { sweepAfterCoreFacts } from '../precool/monitor.js';
 
 const OPERATOR_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 
@@ -276,8 +277,13 @@ export function cmdShavingExecute(s, body, at) {
     }
   }
 
+  // 预冷互锁：短时断电(CUT)使相关箱既有合格证立即失效、豁免自动撤销。
+  // 限功率(LIMIT)不中断供电，不影响合格证。
+  const cutReeferIds = [...new Set(found.filter((a) => a.kind === 'CUT').map((a) => a.reeferId))];
+  const swept = cutReeferIds.length ? sweepAfterCoreFacts(s, at, facts, cutReeferIds) : { facts: [], invalidations: [] };
+
   return {
-    facts,
+    facts: [...facts, ...swept.facts],
     enrich: (state) => {
       // 削峰动作只会降低负载。允许值班员逐步执行（途中可能仍未达标，待剩余动作执行完达标），
       // 但绝不允许执行后净载反弹升高（防止瞬间越限扩大）。
@@ -307,6 +313,7 @@ export function cmdShavingExecute(s, body, at) {
         shipNetA: after.shipNetA,
         withinLimit: check.ok,
         violations: check.violations,
+        invalidations: swept.invalidations,
       };
     },
   };

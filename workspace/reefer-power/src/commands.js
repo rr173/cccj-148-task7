@@ -8,6 +8,7 @@ import {
 } from './domain.js';
 import { planReservations, planMigration, contentionOnCommit, trippedImpact, allocateFresh } from './planner.js';
 import { buildView, committedDemandA } from './views.js';
+import { sweepAfterCoreFacts } from './precool/monitor.js';
 import {
   bad,
   conflict,
@@ -181,10 +182,12 @@ function cursorId(f) {
 
 export function cmdSample(s, body, at) {
   const sensorBootId = checkId(body.sensorBootId, '传感器启动代号');
-  const kind = String(body.kind ?? '').toLowerCase();
-  if (!['current', 'temperature', 'powerloss'].includes(kind)) {
+  const kindRaw = String(body.kind ?? '').toLowerCase();
+  if (!['current', 'temperature', 'powerloss'].includes(kindRaw)) {
     throw bad('样本 kind 必须是 current / temperature / powerLoss');
   }
+  // 规范化：UI/接口允许 powerLoss/powerloss，流水与归并统一使用 powerLoss
+  const kind = kindRaw === 'powerloss' ? 'powerLoss' : kindRaw;
   const measuredAt = num(body.measuredAt, '测量时刻(epoch ms)', { integer: true });
   if (Math.abs(measuredAt - at) > 24 * 3600 * 1000) throw bad('测量时刻与服务器时间相差超过 24 小时');
   const value = num(body.value, '样本数值', { min: -1000, max: 100000 });
@@ -257,8 +260,22 @@ export function cmdSample(s, body, at) {
       });
     }
   }
+
+  // 预冷互锁：已接受的温度/掉电样本可能使既有合格证立即失效
+  // （传感器更换、超温、读数过期；powerLoss 打破供电连续性）。
+  let invalidations = [];
+  let sweepFacts = [];
+  if (accepted && f.reeferId && (kind === 'temperature' || kind === 'powerLoss')) {
+    const extra = kind === 'temperature'
+      ? { measuredAt, value, bootId: sensorBootId }
+      : null;
+    const swept = sweepAfterCoreFacts(s, at, facts, [f.reeferId], { extraSample: extra });
+    sweepFacts = swept.facts;
+    invalidations = swept.invalidations;
+  }
+
   return {
-    facts,
+    facts: [...facts, ...sweepFacts],
     reply: {
       accepted,
       reason,
@@ -266,6 +283,7 @@ export function cmdSample(s, body, at) {
       kind,
       measuredAt,
       quarantined: !accepted,
+      invalidations,
     },
   };
 }
@@ -279,12 +297,33 @@ export function cmdTrip(s, body, at) {
     // 跳闸登记幂等：返回当前影响，不重复登记
     return { facts: [], reply: { tripped: false, alreadyTripped: true, impact: trippedImpact(s, circuitId, at) } };
   }
-  const facts = [{ type: 'tripped', at, circuitId }];
+  const coreFacts = [{ type: 'tripped', at, circuitId }];
+  // 受影响箱 = 跳闸前该回路上的 POWER 租约箱（跳闸事实归并后它们变为 FROZEN）
+  const affectedReeferIds = activeLeaseOfReeferOnCircuitBeforeTrip(s, circuitId);
+  const swept = sweepAfterCoreFacts(s, at, coreFacts, affectedReeferIds);
+  const facts = [...coreFacts, ...swept.facts];
   return {
     facts,
-    // impact 必须在事实归并后计算，由 store 提交后通过 enrich 补入回执
-    enrich: (state) => ({ tripped: true, circuitId, at, impact: trippedImpact(state, circuitId, at) }),
+    // impact 必须在事实归并后计算，由 store 提交后通过 enrich 补入回执；
+    // 预冷合格证/豁免的自动失效也在回执中明示
+    enrich: (state) => ({
+      tripped: true,
+      circuitId,
+      at,
+      impact: trippedImpact(state, circuitId, at),
+      invalidations: swept.invalidations,
+    }),
   };
+}
+
+function activeLeaseOfReeferOnCircuitBeforeTrip(s, circuitId) {
+  const ids = [];
+  for (const l of s.leases) {
+    if (l.state !== 'POWER') continue;
+    const sk = s.sockets.get(l.socketId);
+    if (sk && sk.circuitId === circuitId) ids.push(l.reeferId);
+  }
+  return ids;
 }
 
 // ---------- 迁移方案 ----------
@@ -383,9 +422,12 @@ export function cmdMigrationStep(s, body, at) {
       (l) => l.reeferId === st.reeferId && l.socketId === st.fromSocketId && l.state === 'FROZEN'
     );
     if (!orig) throw conflict(`箱 ${st.reeferId} 在原插座上没有 FROZEN 租约`, { code: 'NO_FROZEN_LEASE' });
+    const coreFacts = [{ type: 'stepAdvanced', at, planId, index, action: 'unplug', leaseId: orig.id }];
+    // FROZEN 通常来自跳闸（掉电已计数、证书已失效）；对未登记掉电的拔除做兜底失效
+    const swept = sweepAfterCoreFacts(s, at, coreFacts, [st.reeferId]);
     return {
-      facts: [{ type: 'stepAdvanced', at, planId, index, action: 'unplug', leaseId: orig.id }],
-      reply: { planId, index, action, state: 'UNPLUGGED' },
+      facts: [...coreFacts, ...swept.facts],
+      reply: { planId, index, action, state: 'UNPLUGGED', invalidations: swept.invalidations },
     };
   }
 

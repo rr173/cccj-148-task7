@@ -62,9 +62,10 @@ export function stopServer(proc) {
   });
 }
 
-export async function restart(proc, dir) {
+export async function restart(proc, dir, opts = {}) {
   await stopServer(proc);
-  return startServer(dir, { port: proc.port });
+  // 崩溃退出(os._exit)后原端口可能仍处于 TIME_WAIT，重启动用新随机端口
+  return startServer(dir, opts);
 }
 
 let cmdSeq = 0;

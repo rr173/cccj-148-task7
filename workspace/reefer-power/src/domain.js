@@ -1,6 +1,7 @@
 'use strict';
 
 import { normPhase, num, round2, nameplateCurrentA, bad, DomainError } from './util.js';
+import { applyPrecoolFact, precoolInvariants } from './precool/projection.js';
 
 // 状态形态：
 // {
@@ -24,6 +25,17 @@ import { normPhase, num, round2, nameplateCurrentA, bad, DomainError } from './u
 //   ],
 //   restoreBatches:[ {id,at,sessionId,state,items,total,recoveredCount,paused,revisionPublished,energySavedAmin} ],
 //   energySavedAmin                                   // 累计节省电量（A·min），仅恢复时一次性记账
+//
+//   // —— 装船前预冷合格证与放行互锁 ——
+//   precoolObs:{ [voyageId|reeferId]: observation },
+//   precoolCerts:[ certificate ],                     // VALID -> INVALIDATED（只追加，永不复活）
+//   precoolWaivers:[ exemption ],                      // ACTIVE -> REVOKED/EXPIRED（只追加）
+//   precoolScans:[ gateScan ],                        // 装船确认/岸桥扫描记录（只追加）
+//   precoolPending:[ pendingEntry ],                  // 温控待处理队列
+//   powerLossCount:{reeferId:n},                      // 供电中断分组计数（每次 POWER->失电 +1）
+//   powerRestoredAt:{reeferId:ts},                    // 最近一次恢复供电时刻
+//   setpointHistory:{reeferId:[{fromC,toC,at,operatorId}]},
+//   precoolSeq                                        // 预冷对象统一序号（证书/豁免/扫描/队列）
 // }
 export function initialState() {
   return {
@@ -46,6 +58,15 @@ export function initialState() {
     shavingActions: [],
     restoreBatches: [],
     energySavedAmin: 0,
+    precoolObs: new Map(),
+    precoolCerts: [],
+    precoolWaivers: [],
+    precoolScans: [],
+    precoolPending: [],
+    powerLossCount: new Map(),
+    powerRestoredAt: new Map(),
+    setpointHistory: new Map(),
+    precoolSeq: 0,
   };
 }
 
@@ -143,6 +164,8 @@ export function assertInvariants(s, tag) {
       }
     }
   }
+
+  precoolInvariants(s, tag);
 }
 
 export function leaseClosed(l) {
@@ -188,14 +211,43 @@ export function applyFact(s, fact) {
     case 'shavingActionsInvalidated': return applyShavingActionsInvalidated(s, fact);
     case 'shavingActionsCancelled': return applyShavingActionsCancelled(s, fact);
     case 'restoreBatchRecorded': return applyRestoreBatch(s, fact);
+    case 'setpointAdjusted': return applySetpointAdjusted(s, fact);
     default:
+      if (fact.type.startsWith('precool')) return applyPrecoolFact(s, fact);
       throw new Error(`未知事实类型: ${fact.type}`);
   }
+}
+
+// 设定点调整：更新箱设定点并追加只增的设定点变更历史（预冷证书/观测据此失效/重计时）
+function applySetpointAdjusted(s, f) {
+  const r = s.reefers.get(f.reeferId);
+  if (!r) throw new Error('设定点调整事实引用了未知箱');
+  const fromC = r.setpointC;
+  r.setpointC = num(f.toC, '设定点(℃)', { min: -100, max: 100 });
+  const hist = s.setpointHistory.get(f.reeferId) || [];
+  hist.push({ at: f.at, fromC, toC: r.setpointC, operatorId: f.operatorId });
+  s.setpointHistory.set(f.reeferId, hist);
+  return s;
 }
 
 function nextLeaseId(s) {
   s.seq += 1;
   return `L${String(s.seq).padStart(5, '0')}`;
+}
+
+// 登记一次「供电中断分组」：仅当该箱当前不在已登记的断电中时计数 +1。
+// 同一轮掉电（跳闸、powerLoss 样本、拔除）不会重复计数；重新送电后再次掉电算新一组。
+export function registerPowerLoss(s, reeferId, at) {
+  if (s.powerLossAt.get(reeferId) != null) return false;
+  s.powerLossAt.set(reeferId, at);
+  s.powerLossCount.set(reeferId, (s.powerLossCount.get(reeferId) ?? 0) + 1);
+  return true;
+}
+
+// 登记恢复供电：清掉电时刻并记录最近恢复时刻（预冷观测据此重新计时）
+export function registerPowerRestored(s, reeferId, at) {
+  s.powerLossAt.delete(reeferId);
+  s.powerRestoredAt.set(reeferId, at);
 }
 
 function applyTopology(s, f) {
@@ -293,7 +345,7 @@ function applySample(s, f) {
   }
   if (f.accepted && f.kind === 'powerLoss' && f.reeferId) {
     const prev = s.powerLossAt.get(f.reeferId);
-    if (prev == null || f.measuredAt > prev) s.powerLossAt.set(f.reeferId, f.measuredAt);
+    if (prev == null || f.measuredAt > prev) registerPowerLoss(s, f.reeferId, f.measuredAt);
   }
   return s;
 }
@@ -308,7 +360,7 @@ function applyTripped(s, f) {
     const sk = s.sockets.get(l.socketId);
     if (sk && sk.circuitId === f.circuitId) {
       l.state = 'FROZEN';
-      if (s.powerLossAt.get(l.reeferId) == null) s.powerLossAt.set(l.reeferId, f.at);
+      registerPowerLoss(s, l.reeferId, f.at);
     }
   }
   return s;
@@ -329,7 +381,7 @@ function applyReset(s, f) {
       );
       if (inMigration) continue;
       l.state = 'POWER';
-      s.powerLossAt.delete(l.reeferId);
+      registerPowerRestored(s, l.reeferId, f.at);
     }
   }
   return s;
@@ -406,10 +458,10 @@ function applyStepAdvanced(s, f) {
     const oldLease = leaseById(s, f.oldLeaseId);
     if (oldLease && oldLease.id !== st.newLeaseId) {
       oldLease.state = 'SUPERSEDED';
-      s.powerLossAt.delete(st.reeferId);
+      registerPowerRestored(s, st.reeferId, f.at);
     }
     if (oldLease && oldLease.id === st.newLeaseId) {
-      s.powerLossAt.delete(st.reeferId);
+      registerPowerRestored(s, st.reeferId, f.at);
     }
     st.state = 'DONE';
   } else {
@@ -593,6 +645,8 @@ function applyShavingActionExecuted(s, f) {
   a.heldA = f.heldA;
   a.releaseA = f.releaseA;
   a.incrementalReleaseA = f.incrementalReleaseA ?? a.incrementalReleaseA;
+  // 削峰短时断电也是真实掉电：登记一个断电分组，预冷合格证据此失效
+  if (a.kind === 'CUT') registerPowerLoss(s, a.reeferId, f.at);
   return s;
 }
 
@@ -628,6 +682,8 @@ function applyRestoreBatch(s, f) {
     a.status = 'RESTORED';
     a.restoredAt = f.at;
     a.restoredBatchId = f.batchId;
+    // 削峰断电恢复：清掉电标记并记录恢复时刻（预冷观测需重新计时）
+    if (a.kind === 'CUT') registerPowerRestored(s, a.reeferId, f.at);
     // 节省电量 = 实际释放电流(A) × 已执行时长(min)，仅在恢复时一次性记账，绝不重复
     const heldA = a.kind === 'LIMIT'
       ? (a.heldA ?? a.plannedHeldA ?? 0)

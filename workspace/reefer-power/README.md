@@ -1,4 +1,4 @@
-# 冷藏箱岸电接入、断电迁移、分时功率预算与负荷削峰模块
+# 冷藏箱岸电接入、断电迁移、分时功率预算与负荷削峰、装船前预冷合格证与放行互锁模块
 
 零依赖纯 Node.js（>=20）实现。提供浏览器操作台与 HTTP 接口，管理冷藏箱岸电插座预留、接电、
 传感器采样（电流/温度/掉电）、回路跳闸冻结、按温控优先级的有序迁移与争用裁决；以及
@@ -30,7 +30,7 @@ node scripts/seed-demo.mjs
 npm test          # node --test test/
 ```
 
-覆盖需求全部验收场景（接电/迁移 7 个 + 削峰 10 个）：
+覆盖需求全部验收场景（接电/迁移 7 个 + 削峰 10 个 + 预冷合格证/放行互锁 14 个）：
 1. 正常预留并接电（一箱/一座位唯一、送电容量复核）
 2. 容量 / 相制 / 箱型 / 可达性 / 无预留的拒绝
 3. 采样重复回放、同键异值与命令标识复用冲突拒绝、超时钟偏差倒序样本隔离
@@ -41,6 +41,10 @@ npm test          # node --test test/
 8. 削峰：无需削峰、仅限功率达标、必须断电、过期读数回退铭牌、重叠预算合并、
    并发旧修订冲突与请求标识幂等、计划失效重算（只撤未执行）、结束后分批风险优先恢复、
    恢复途中遇更低上限暂停重算、发布/执行/恢复三个持久化边界崩溃恢复（无重复控制/重复记账/越限）
+9. 预冷合格证：稳定温度正常签发（高风险更严阈值）、过期读数不签发、观测中途掉电后重新计时、
+   传感器更换使旧证失效、无证扫描进待处理（计划/插座不变）、有效豁免放行后因超温自动撤销、
+   豁免字段与到期校验、无真实温度不放行、设定点调整失效、operationId 首次结果与冲突、
+   竞争签发收敛到单一证书、以及签发/失效/扫描三个落盘阶段崩溃后状态与装船结果相符（14 用例）
 
 ## HTTP 接口
 
@@ -65,6 +69,13 @@ npm test          # node --test test/
 | `POST /api/peak/recompute` | 电流/温度变化致原计算失效：只撤销未执行动作并生成新修订，已生效事实保留 |
 | `POST /api/peak/cancel` | 手动撤销方案：仅作废尚未执行动作，已生效限功率/断电不消失 |
 | `POST /api/peak/restore` | 预算结束后分批恢复（`{maxBatchSize}`）；按可用余量与温度风险优先，途中遇更低上限暂停重算 |
+| `POST /api/precool/observe` | 发起/重新发起装船前预冷观测 |
+| `POST /api/precool/certificates` | 签发预冷合格证（持续合格 + `expectedVersion`） |
+| `POST /api/precool/setpoint` | 调整设定点（旧证立即失效） |
+| `POST /api/precool/waivers` | 临时豁免（原因/有效期/货物负责人，超温掉电自动撤销） |
+| `POST /api/precool/gate-scan` | 装船确认/岸桥扫描查询合格证并互锁（`operationId` 首次结果） |
+| `POST /api/precool/pending/resolve` | 待处理处置 reobserve/waive/dismiss |
+| `GET  /api/precool/release` `/api/precool/board` | 放行判定 / 预冷看板快照 |
 | `GET /api/state` | 读模型：拓扑/实时负载/样本 + `peak`（预算曲线、新鲜度、削峰动作、温度风险、节省量、恢复进度） |
 
 ### 幂等语义
@@ -138,6 +149,78 @@ REEFER_NOT_POWERED / LIMIT_NOT_EFFECTIVE / NO_REVISION` 等。
 * 恢复途中收到更低上限：**暂停恢复**，在“已归还本批”的状态上重新计算并发布新修订，
   归还后不得越过有效预算；暂停批次前不会归还任何会导致越限的电流。
 * 累计节省电量 `cumulativeEnergyAmin`（A·min）只在动作恢复（或限功率被断电升级）时一次性记账，绝不重复计算。
+
+## 装船前预冷合格证与放行互锁（precool）
+
+冷藏箱装船前必须持**预冷合格证**或**临时豁免**才能通过装船确认/岸桥扫描。系统从岸电模块读取
+**箱温、设定点、温度变化速度、采样来源（传感器启动代号）与供电连续性**，
+只有数据在规定时间窗内**持续合格**才签发合格证；合格证**绑定箱号、航次、传感器启动代号与观测区间摘要**。
+
+### 稳定策略（按货物风险分级，可用环境变量覆盖）
+
+| 风险（cargoGrade） | 稳定时间 | 偏差阈值 | 变化速度 | 读数间隔 | 读数年龄 |
+|---|---|---|---|---|---|
+| 高风险 PHARMA/HIGH | 30 分钟 | 0.5℃ | 1.0℃/h | 5 分钟 | 5 分钟 |
+| 中风险 FRESH/CHILLED | 20 分钟 | 1.5℃ | 2.0℃/h | 5 分钟 | 10 分钟 |
+| 低风险 FROZEN/GENERAL | 10 分钟 | 3.0℃ | 3.0℃/h | 10 分钟 | 15 分钟 |
+
+只认**真实温度样本**（`source=SHORE_POWER_MEASURED`），**不能用铭牌估算替代真实温度**完成放行；
+无真实读数时返回 `NO_TEMP_READING`。环境变量：`PRECOOL_STABLE_MIN_HIGH` / `PRECOOL_DEVIATION_C_HIGH`
+等（后缀 `HIGH/MEDIUM/LOW`），豁免有效期上限 `PRECOOL_WAIVER_MAX_MIN`（默认 60 分钟）。
+
+### 立即失效与重新观测
+
+下列事件使**已有合格证立即失效**，并在失效事实中给出**重新观测起点 `restartFrom` 与剩余稳定时长 `restartRemainingMs`**：
+
+- **读数过期** `READING_STALE`：最新读数超过读数年龄窗口；
+- **传感器更换** `SENSOR_BOOT_CHANGED`：观测区间内出现与绑定启动代号不同的 `sensorBootId`；
+- **设定点调整** `SETPOINT_CHANGED`（`POST /api/precool/setpoint`）；
+- **期间掉电** `POWER_LOSS`：跳闸、`powerLoss` 样本、迁移拔除、削峰短时断电(CUT) 都会产生新的断电分组；
+- 偏差/变化速度越限 `DEVIATION_EXCEEDED` / `RATE_EXCEEDED`。
+
+失效单向不可逆：`VALID -> INVALIDATED`，**已失效证书永不复活**；掉电恢复后由值班员**重新发起观测**重新计时。
+
+### 装船确认 / 岸桥扫描与待处理队列
+
+`POST /api/precool/gate-scan`（可 `stage=GATE/LOAD_CONFIRM`，`operationId` 采用首次结果语义）：
+
+- 有效合格证 -> `RELEASED (basis=CERT)`；有效豁免 -> `RELEASED (basis=WAIVER)`；
+- 缺失/失效 -> `PENDING`，进入**温控待处理队列**；**原装船计划与插座事实保持不变**
+  （`loadingPlanUntouched` / `socketFactUntouched`），重复扫描复用同一 OPEN 条目。
+- 值班员在**恢复供电后**可对队列条目 `action=reobserve` 重新观测，
+  或提交**带原因、有效期、货物负责人身份**的临时豁免（`action=waive`）。
+
+临时豁免只覆盖**指定航次与箱号**；后续出现**新的超温或掉电即自动撤销**
+（`ACTIVE -> REVOKED: OVER_TEMPERATURE / POWER_LOSS`，到期为 `EXPIRED`）。
+
+### 并发与版本（operationId 首次结果语义）
+
+- 证书/豁免/待处理按 `(航次,箱号)` 聚合，事实携带单调 `version`；签发/豁免支持 `expectedVersion` 前置条件。
+- 服务端写命令串行化，竞争签发收敛为**单一有效证书**（负者收到 `CERT_ALREADY_VALID`/`VERSION_CONFLICT`），
+  竞争豁免收敛为单一豁免；**旧页面不能覆盖后来产生的失效状态**。
+- `operationId`（或 `X-Command-Id`）采用首次结果语义：同键回放首次结果（含首次失败），同键不同载荷 `IDEMPOTENCY_CONFLICT`。
+
+### 接口
+
+| 接口 | 说明 |
+|---|---|
+| `POST /api/precool/observe` | 发起/重新发起观测（必须当前由岸电供电；携带 bootId/掉电基线） |
+| `POST /api/precool/certificates` | 数据持续合格后签发（`expectedVersion` 前置，返回证据区间摘要） |
+| `POST /api/precool/setpoint` | 调整设定点（相关证书立即失效、观测需重新计时） |
+| `POST /api/precool/waivers` | 临时豁免：`reason/cargoOwner/validMinutes`（上限 60 分钟） |
+| `POST /api/precool/gate-scan` | 装船确认/岸桥扫描查询当前合格证并互锁（`operationId` 首次结果） |
+| `POST /api/precool/pending/resolve` | 待处理处置：`reobserve / waive / dismiss` |
+| `GET  /api/precool/release?voyageId=&reeferId=` | 只读放行判定 |
+| `GET  /api/precool/board` | 合格进度/证据/失效原因/待处理/豁免倒计时/放行结果快照（也并入 `/api/state` 的 `precool`） |
+
+### 持久化与崩溃恢复
+
+证书签发、自动失效、重新观测、豁免、扫描/放行、待处理全部作为事实写入**同一不可变流水与检查点**。
+归并期不变量（`precoolInvariants`）保证：每 `(航次,箱号)` 至多一张有效证书、至多一个有效豁免、
+至多一个 OPEN 待处理条目，版本严格单调。三个落盘边界可用故障注入（`--test-faults`）验证：
+`precoolCertificateIssued` / `precoolCertificateInvalidated` / `precoolGateScanned`
+（fsync 后、内存归并前 `exit`）——重启后同一观测区间签不出两张有效证书、已失效证书不复活、
+同 `operationId` 重放首次放行结果且不产生第二条扫描。
 
 ## 持久化与崩溃恢复
 
